@@ -3,12 +3,16 @@ import math
 import pandas as pd
 from openpyxl import load_workbook
 import re
+import time
 
-# Datu lasīšana no Excel faila (klases, skolotāji, telpas, klases skolotāji)
-dfKS = pd.read_excel("Skolotaji.xlsx", sheet_name="Klases sk.")
-dfS = pd.read_excel("Skolotaji.xlsx", sheet_name="Skolotaji")
-dfMP = pd.read_excel("Skolotaji.xlsx", sheet_name="M.priekšmeti")
-dfP = pd.read_excel("Skolotaji.xlsx", sheet_name="Programma")
+start_time = time.time()
+
+# Datu lasīšana no Excel faila (skolotāji, telpas, klases skolotāji, programma)
+input  = input("Ievadi ievaddatu MS Excel faila nosaukumu: ")
+excel = input + ".xlsx"
+dfKS = pd.read_excel(excel, sheet_name="Klases sk.")
+dfS = pd.read_excel(excel, sheet_name="Skolotaji")
+dfP = pd.read_excel(excel, sheet_name="Programma")
 
 # Programma
 dfP.columns = ['Subject', '7', '8', '9']
@@ -32,12 +36,17 @@ rooms = dict(zip(dfS["Skolotājs"], dfS["Telpa"]))
 # Mācību priekšmets un skolotāji
 teachers = {}
 
-for index, row in dfMP.iterrows():
-    subject = row["Mācību priekšmeti"]  
-    t_list = [teacher for teacher in row[1:].dropna().tolist() if teacher != subject]  
-    teachers[subject] = t_list
+# Skolotāju datnes aizpildīšāna
+for _, row in dfS.iterrows():
+    for column in dfS.columns[3:]:  
+        subject = row[column]
+        if pd.notna(subject):  
+            if subject not in teachers:
+                teachers[subject] = []
+            teachers[subject].append(row['Skolotājs'])
 
 teachers["Klases stunda"] = list(class_teachers.values())
+
 
 # 5 mācību dienas nedēļā
 days = range(1, 6) 
@@ -58,10 +67,9 @@ teacher_load = 23
 
 #  SKOLOTĀJU PRASĪBAS
 
-excel_path = "Skolotaji.xlsx"
-xlsx = pd.ExcelFile(excel_path)
+xlsx = pd.ExcelFile(excel)
+teachers_df = pd.read_excel(excel, sheet_name="Skolotaji")\
 
-teachers_df = pd.read_excel(excel_path, sheet_name="Skolotaji")
 # Vārdnīca, kur atslēga ir skolotāja numurs, bet vērtība ir V. Uzvārds
 teacher_names = dict(zip(teachers_df['Nr.'], teachers_df['Skolotājs']))
 
@@ -88,7 +96,6 @@ for sheet in xlsx.sheet_names:
         continue
 
     teacher_number = int(match.group(1))
-    print(teacher_number)
     priority = match.group(2)
 
     # Meklējam skolotāja vārdu
@@ -100,7 +107,7 @@ for sheet in xlsx.sheet_names:
 
     valid_days = ["Pirmdiena", "Otrdiena", "Trešdiena", "Ceturtdiena", "Piektdiena"]
 
-    df = pd.read_excel(excel_path, sheet_name=sheet)
+    df = pd.read_excel(excel, sheet_name=sheet)
     df = df.drop(df.columns[0], axis=1)
     df = df.loc[:, df.columns.isin(valid_days)]
     df = df.head(8)
@@ -117,10 +124,6 @@ for sheet in xlsx.sheet_names:
             dict1[full_name] = schedule
         elif priority == '2':
             dict2[full_name] = schedule
-
-print(dict1)
-print(dict2)
-
 
 # Visu iespējamo mācību priekšmetu saraksts
 subjects = {grade: list(programs[grade[0]].keys()) for grade in classes}
@@ -150,16 +153,56 @@ z = LpVariable.dicts("z", [(c, d, t) for c in classes for d in days for t in ran
 # Mīksto ierobežojumu pievienošana
 # Skolotāju vēlami laiki ar prioritāti 2
 penalty = lpSum([
-    x[(c, s, d, t, tc, rooms[tc])]
-    for c in classes
-    for s in subjects[c]
-    for d in days
+    x[(c, s, d, t, tc, rooms[tc])]for c in classes for s in subjects[c] for d in days
     for t in range(1, slots[c[0]] + 1)
     for tc in teachers[s]
     if tc in dict2 and t in dict2[tc].get(day_name[d], [])
 ])
+
 prob += penalty
 
+# Ierobežojums: skolotājs vienlaikus var pasniedz tikai vienu stundu
+for tc in set([t for sublist in teachers.values() for t in sublist]):
+    room = rooms[tc]
+    for d in days:
+        for t in range(1, max(slots.values()) + 1):
+            prob += lpSum(x[c, s, d, t, tc, room] for c in classes for s in subjects[c] 
+                if tc in teachers[s] and t <= slots[c[0]]) <= 1
+
+# Ierobežojums: skolotājs nedrīkst parsniegt vairāk nekā 23 stundas nedēļā
+for tc in set([t for sublist in teachers.values() for t in sublist]):
+    room = rooms[tc]
+    prob += lpSum(x[c, s, d, t, tc, room] for c in classes for s in subjects[c] 
+                  for d in days for t in range(1, slots[c[0]] + 1)
+                  if tc in teachers[s]) <= teacher_load
+
+# Ierobežojums: stundas jābūt bez "logiem" brīvām stundām
+for c in classes:
+    for d in days:
+        for t in range(1, slots[c[0]] + 1):
+            sum_lessons = lpSum(
+                x[(c, s, d, t, tc, rooms[tc])]
+                for s in subjects[c]
+                for tc in teachers[s]
+            )
+            prob += sum_lessons >= z[c, d, t]
+            prob += sum_lessons <= z[c, d, t] * 2
+
+# Ierobežojums: ja stundas ir slotā t, tad tās jābūt arī slotā t-1 (ja t >= 2)
+for c in classes:
+    for d in days:
+        for t in range(2, slots[c[0]] + 1):
+            prob += z[c, d, t] <= z[c, d, t-1]
+
+# Ierobežojums: vienā laika slotā vienu telpu var izmantot tikai viena klase
+for room in set(rooms.values()):
+    for d in days:
+        for t in range(1, max(slots.values()) + 1):
+            prob += lpSum(x[c, s, d, t, tc, room] 
+                      for c in classes 
+                      for s in subjects[c] 
+                      for tc in teachers[s] 
+                      if rooms[tc] == room and t <= slots[c[0]]) <= 1
 
 # Ierobežojums: skolotāju prasības (1.prioritāte(obligāta)) Vēlami un nevēlami darba laiki
 for c in classes:
@@ -219,23 +262,6 @@ for c in classes:
         prob += lpSum(x[(c, s, d, 1, tc, rooms[tc])] 
         for s in subjects[c] for tc in teachers[s]) >= 1 # >=1, ja ir svešvaloda, tad x vērtība  laikas slotā t būs vienāds ar 2
         
-# Ierobežojums: stundas jābūt bez "logiem" brīvām stundām
-for c in classes:
-    for d in days:
-        for t in range(1, slots[c[0]] + 1):
-            sum_lessons = lpSum(
-                x[(c, s, d, t, tc, rooms[tc])]
-                for s in subjects[c]
-                for tc in teachers[s]
-            )
-            prob += sum_lessons >= z[c, d, t]
-            prob += sum_lessons <= z[c, d, t] * 2
-
-# Ierobežojums: ja stundas ir slotā t, tad tās jābūt arī slotā t-1 (ja t >= 2)
-for c in classes:
-    for d in days:
-        for t in range(2, slots[c[0]] + 1):
-            prob += z[c, d, t] <= z[c, d, t-1]
 
 # Ierobežojums: viens un tas pats priekšmets nevar atkārtoties vienā dienā (ja būs mīkstie ier. tad būs jāiekļauj izņemumus)
 for c in classes:
@@ -245,6 +271,17 @@ for c in classes:
             prob += lpSum(x[c, s, d, t, tc, rooms[tc]] 
             for t in range(1, slots[grade] + 1) 
             for tc in teachers[s]) <= 1
+
+# Ierobežojums: ja skolotājs pasniedz kaut vienu priekšmeta s stundu klasei c, tad viņam jāpasniedz visas šī priekšmeta stundas šajā klasē
+for c in classes:
+    for s in subjects[c]:
+        for tc in teachers[s]:
+            room = rooms[tc]
+            # Ja skolotājs ir izvēlēts priekšmeta pasniegšanai, viņam jāvada visas šī priekšmeta stundas šajā klasē
+            prob += lpSum(x[c, s, d, t, tc, room] for d in days for t in range(1, slots[c[0]] + 1)) <= y[c, s, tc] * 1000
+
+        # Nodrošinām, ka tikai viens skolotājs pasniedz šo priekšmetu konkrētajai klasei
+        prob += lpSum(y[c, s, tc] for tc in teachers[s]) == 1
 
 # Ierobežojums: stundas jāsadala vienmērīgi pa dienām, uzstadot minimālu stundu skaitu dienā
 for c in classes:
@@ -258,50 +295,19 @@ for c in classes:
         for t in range(1, slots[grade] + 1)
         for tc in teachers[s]) >= min_lessons_per_day
         
-# Ierobežojums: skolotājs vienlaikus var pasniedz tikai vienu stundu
-for tc in set([t for sublist in teachers.values() for t in sublist]):
-    room = rooms[tc]
-    for d in days:
-        for t in range(1, max(slots.values()) + 1):
-            prob += lpSum(x[c, s, d, t, tc, room] for c in classes for s in subjects[c] 
-                if tc in teachers[s] and t <= slots[c[0]]) <= 1
-
-# Ierobežojums: skolotājs nedrīkst parsniegt vairāk nekā 23 stundas nedēļā
-for tc in set([t for sublist in teachers.values() for t in sublist]):
-    room = rooms[tc]
-    prob += lpSum(x[c, s, d, t, tc, room] for c in classes for s in subjects[c] 
-                  for d in days for t in range(1, slots[c[0]] + 1)
-                  if tc in teachers[s]) <= teacher_load
-
-# Ierobežojums: ja skolotājs pasniedz kaut vienu priekšmeta s stundu klasei c, tad viņam jāpasniedz visas šī priekšmeta stundas šajā klasē
-for c in classes:
-    for s in subjects[c]:
-        for tc in teachers[s]:
-            room = rooms[tc]
-            # Ja skolotājs ir izvēlēts priekšmeta pasniegšanai, viņam jāvada visas šī priekšmeta stundas šajā klasē
-            prob += lpSum(x[c, s, d, t, tc, room] for d in days for t in range(1, slots[c[0]] + 1)) <= y[c, s, tc] * 1000
-
-        # Nodrošinām, ka tikai viens skolotājs pasniedz šo priekšmetu konkrētajai klasei
-        prob += lpSum(y[c, s, tc] for tc in teachers[s]) == 1
-
-# Ierobežojums: vienā laika slotā vienu telpu var izmantot tikai viena klase
-for room in set(rooms.values()):
-    for d in days:
-        for t in range(1, max(slots.values()) + 1):
-            prob += lpSum(x[c, s, d, t, tc, room] 
-                      for c in classes 
-                      for s in subjects[c] 
-                      for tc in teachers[s] 
-                      if rooms[tc] == room and t <= slots[c[0]]) <= 1
 
 # Risinājums
 prob.solve(GUROBI())
 # Sodu skaits 
 print(f"Kopējais sods: {value(penalty)}")
 
+end_time = time.time()
+execution_time = end_time - start_time
+
+print(f"Algoritms srādā {execution_time:.4f} sekundes.")
+
 # SKOLOTĀJU DARBA GRAFIKI
 all_teachers = set(tc for t_list in teachers.values() for tc in t_list)
-
 teacher_schedule = {tc: {d: {t: [] for t in range(1, max(slots.values()) + 1)} for d in days} for tc in all_teachers}
 
 for c in classes:
@@ -315,32 +321,11 @@ for c in classes:
                     if var_key in x and x[var_key].value() == 1:
                         teacher_schedule[tc][d][t].append((c, s, room))
 
-# Excel
-teacher_columns = ["Diena", "Slots", "Klase", "Priekšmets"]
-n = ["Pirmdiena", "Otrdiena", "Trešdiena", "Ceturdiena", "Piektdiena"]
-teacher_schedule_df = pd.DataFrame(columns=["Skolotājs"] + teacher_columns)
-
-for tc in sorted(all_teachers):
-    for d in days:
-        for t in range(1, max(slots.values()) + 1):
-            lessons = teacher_schedule[tc][d][t]
-            if lessons:
-                for c, s, room in lessons:
-                    row = {
-                        "Skolotājs": tc,
-                        "Diena": n[d - 1],
-                        "Slots": t,
-                        "Klase": c,
-                        "Priekšmets": s,
-                    }
-                    teacher_schedule_df = pd.concat([teacher_schedule_df, pd.DataFrame([row])], ignore_index=True)
-
-teacher_schedule_df.to_excel("Teacher_Schedule.xlsx", index=False)
-print("Saglābāts fails: 'Teacher_Schedule.xlsx'")
 
 # STUNDU SARAKSTA SAGLABĀŠANA EXCEL FAILĀ 
 schedule_data = []
-columns = ["Dienas", "Slots"]
+columns = ["Diena", "Laiks"]
+n = ["Pirmdiena", "Otrdiena", "Trešdiena", "Ceturdiena", "Piektdiena"]
 empty_col_index = 1 
 
 for c in classes:
@@ -351,7 +336,7 @@ schedule_df = pd.DataFrame(columns=columns)
 
 for d in days:
     for t in range(1, max(slots.values()) + 1):
-        row_data = {"Dienas": n[d - 1] if t == 1 else "", "Slots": t}
+        row_data = {"Diena": n[d - 1] if t == 1 else "", "Laiks": t}
 
         for i, c in enumerate(classes, start=1):
             if t <= slots[c[0]]:
@@ -392,14 +377,11 @@ for d in days:
     schedule_df = pd.concat([schedule_df, pd.DataFrame([empty_row])], ignore_index=True)
 
 schedule_df.to_excel("Stundu_saraksts.xlsx", index=False)
-
 print("Saglabāts fails 'Stundu_saraksts.xlsx'")
-
 
 # Kolonnu auto izlidzināšana pēc teksta
 file_path = "Stundu_saraksts.xlsx"
 schedule_df.to_excel(file_path, index=False)
-
 wb = load_workbook(file_path)
 ws = wb.active
 
